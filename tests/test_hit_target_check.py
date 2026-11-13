@@ -53,6 +53,10 @@ class _Injected:
         self.origin_reads = 0
         self.log = log if log is not None else []
 
+    def landing_scope(self, frame, element, point):
+        # No shadow tree under the point: the element is its own scope.
+        return None
+
     def check_hit_target(self, frame, element, point):
         self.points.append(point)
         self.frames.append(frame)
@@ -303,3 +307,62 @@ def test_a_frame_flattened_to_a_line_falls_back_to_the_shift():
     and the click is not made by this number."""
     flat = {"x": 30.0, "y": 60.0, "ex": {"x": 0.0, "y": 0.0}, "ey": {"x": 0.0, "y": 0.0}}
     assert _frame_point(flat, (10.0, 20.0)) == (-20.0, -40.0)
+
+
+class _ShadowInjected(_Injected):
+    """A point inside a shadow tree that lies inside the element: the injected
+    read answers that tree's root, and records what is released."""
+
+    def __init__(self, scope, log):
+        super().__init__(log=log)
+        self.scope, self.disposed = scope, []
+
+    def landing_scope(self, frame, element, point):
+        self.log.append("scope")
+        return self.scope
+
+    def dispose(self, frame, element):
+        self.log.append("dispose")
+        self.disposed.append(element)
+
+
+class _NamingConn(_Conn):
+    def __init__(self):
+        super().__init__()
+        self.lands_on: list = []
+
+    def send(self, method, params=None, **kw):
+        if method == "Page.dispatchMouseEvent" and "landsOn" in (params or {}):
+            self.lands_on.append(params["landsOn"]["objectId"])
+        return super().send(method, params, **kw)
+
+
+@pytest.mark.parametrize("scope,named", [("shadow-root", "shadow-root"),
+                                         (None, "element")])
+def test_a_click_inside_a_shadow_tree_names_that_tree_for_its_landing(scope, named):
+    """⛔ THE ENGINE JUDGES `node.contains(target)`, and `contains` stops at a
+    shadow boundary. A web component's own `<button>` or icon is the event's
+    target, so naming the component itself read as a miss of the component:
+    Partner Center's `he-button` raised ActionMissed on every click ("mousedown
+    landed on path"). The press and the release name the shadow root the point
+    is in when that tree is inside the element, and the element otherwise; the
+    root is released after the commit, never before it.
+
+    To watch this fail, name `element` in `_landing_target` again: the
+    shadow-root arm then sees `element` twice.
+    """
+    log: list = []
+    actions = _actions(log=log)
+    actions.inj = _ShadowInjected(scope, log)
+    actions.c = _NamingConn()
+    approach, commit = _halves(log, actions)
+
+    assert actions._act_on_target(MAIN, "element", (10.0, 20.0),
+                                  approach=approach, commit=commit) == "ok"
+
+    assert actions.c.lands_on == [named, named]
+    if scope:
+        assert log == ["approach", "check", "scope", "commit", "dispose"]
+        assert actions.inj.disposed == [scope]
+    else:
+        assert log == ["approach", "check", "scope", "commit"]

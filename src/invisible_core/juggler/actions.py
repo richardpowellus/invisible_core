@@ -656,11 +656,21 @@ class Actions:
         # turn. A question asked afterwards (`Page.pointerLanded`, until
         # firefox-39) met whatever the page had become by then - a submit that
         # navigated had already taken the element away. [B230]
-        self._landing_target, self._landings = (f, element), {}
+        #
+        # ⛔ AND THE NODE IT NAMES IS THE TREE THE EVENT WILL LAND IN. The
+        # engine judges with `contains`, which stops at a shadow boundary, so a
+        # web component's own `<button>` or icon read as a miss of the
+        # component (`Injected.landing_scope`). When the point is inside a
+        # shadow tree that is inside the element, that tree's root is named
+        # instead; otherwise the element, as before.
+        scope = self.inj.landing_scope(f, element, self._hit_point(f, point))
+        self._landing_target, self._landings = (f, scope or element), {}
         try:
             result = commit()
         finally:
             self._landing_target = None
+            if scope:
+                self.inj.dispose(f, scope)
         landings = self._landings
         # ⛔ A DIALOG THE ACTION OPENED ENDS THE ENGINE'S WAIT with no verdict:
         # the page's process is inside the dialog, and the dialog is the proof

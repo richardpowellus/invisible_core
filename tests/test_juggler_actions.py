@@ -205,6 +205,10 @@ class _Recorder:
     def evaluate(self, frame, expression, **kw):
         return {"w": 1280, "h": 800}
 
+    def landing_scope(self, frame, element, point):
+        # No shadow tree under the point: the element is its own scope.
+        return None
+
     def check_hit_target(self, frame, element, point):
         return "done"
 

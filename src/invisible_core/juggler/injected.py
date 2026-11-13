@@ -749,6 +749,46 @@ class InjectedScript:
         return self.c.send("Page.getFrameOrigin", {"frameId": frame_id},
                            session=self.session, timeout=None)
 
+    def landing_scope(self, frame_id: str, element: str, point) -> Optional[str]:
+        """The shadow root a pointer event at `point` will land in, when that
+        tree lies inside `element`; None when the element itself is the scope.
+
+        ⛔ THE ENGINE JUDGES A LANDING WITH `node.contains(target)`, and the
+        target it records is the event's `composedTarget`: the deepest node,
+        inside whatever shadow trees it sits in. `contains` does not cross a
+        shadow boundary, so a click on a web component - a button whose
+        `<button>` and icon live in its shadow root - landed on `path` inside
+        the icon's root and was told it had missed the very element it was
+        aimed at, and pressed. Measured on Partner Center's `he-button`: every
+        click raised `ActionMissed` ("mousedown landed on path").
+
+        The answer is a node in the SAME tree as the target, which `contains`
+        can judge: the root of the deepest shadow tree under the point, handed
+        over only when that tree is composed-inside the element - each host on
+        the way up is the element or inside it. Anything else (no shadow tree,
+        the element's own tree, a tree outside the element) answers None and
+        the element is judged as before, so a real miss still reads as one.
+        """
+        return self.call(
+            frame_id,
+            "(injected, el, x, y) => {"
+            "  let hit = el.ownerDocument.elementFromPoint(x, y);"
+            "  while (hit && hit.shadowRoot) {"
+            "    const inner = hit.shadowRoot.elementFromPoint(x, y);"
+            "    if (!inner || inner === hit) break;"
+            "    hit = inner;"
+            "  }"
+            "  if (!hit) return null;"
+            "  const scope = hit.getRootNode();"
+            "  if (scope === el.getRootNode() || scope.nodeType !== 11 || !scope.host)"
+            "    return null;"
+            "  for (let r = scope; r && r.nodeType === 11 && r.host; r = r.host.getRootNode())"
+            "    if (r.host === el || el.contains(r.host)) return scope;"
+            "  return null;"
+            "}",
+            {"objectId": element}, float(point[0]), float(point[1]),
+            by_value=False)
+
     def check_hit_target(self, frame_id: str, element: str, point) -> str:
         """Does `point` still belong to `element`? `"done"`, or what is there.
 
