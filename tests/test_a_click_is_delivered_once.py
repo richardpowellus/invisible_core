@@ -146,12 +146,16 @@ class _Injected:
             return {"ok": True}
         return {"ok": False, "missing": "visible"}
 
+    def landing_scope(self, frame, element, point):
+        # No shadow tree under the point: the element is its own scope.
+        return None
+
     def check_hit_target(self, frame, element, point):
         self.checks += 1
         return "done" if self.page.hittable else "<div id='something-else'>"
 
-    def scroll_into_view(self, frame, element):
-        return False
+    def scroll_into_view(self, frame, element, rect=None):
+        return None
 
     def dispose(self, frame, element):
         pass

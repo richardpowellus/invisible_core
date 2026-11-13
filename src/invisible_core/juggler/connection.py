@@ -31,14 +31,17 @@ actionability.
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
 import time
 from typing import Any, Callable, Optional
 
+from .. import _engine_env
 from .deadline import Deadline
 
 NUL = b"\x00"
@@ -382,6 +385,22 @@ class EventListeners:
                     self.handler_errors.append("%s: %s" % (method, failure))
 
 
+#: `sys.platform == "win32"`, a name of its own so that a test can stand on either side.
+_IS_WINDOWS = sys.platform == "win32"
+#: How long a write that failed with EINVAL on Windows waits for the proof that the engine is gone (seconds).
+_GONE_WAIT = 1.0
+
+
+def _is_a_closed_pipe(exc: OSError) -> bool:
+    """A write that failed because the other end of the pipe is closed: EPIPE (`BrokenPipeError`) everywhere, and on Windows also
+    ERROR_BROKEN_PIPE (109) and ERROR_NO_DATA (232), the two codes a pipe says it by. NOT EINVAL: on Windows a pipe whose reader
+    is gone can also come out as EINVAL, but so does a descriptor that is not valid or a count out of range, and a bare errno
+    cannot tell them apart (`Connection._engine_is_gone` can)."""
+    if isinstance(exc, BrokenPipeError) or exc.errno == errno.EPIPE:
+        return True
+    return _IS_WINDOWS and getattr(exc, "winerror", None) in (109, 232)
+
+
 class Connection(EventListeners):
     """A pipe to an already-launched Firefox."""
 
@@ -440,7 +459,8 @@ class Connection(EventListeners):
                     if raw:
                         self._deliver(raw)
         except OSError as e:
-            self._error = e
+            with self._lock:
+                self._error = e
         finally:
             self._closed = True
             # ⛔ Whoever is waiting must be WOKEN UP, not left to the
@@ -597,8 +617,15 @@ class Connection(EventListeners):
         msg: dict = {"id": msg_id, "method": method, "params": params or {}}
         if session:
             msg["sessionId"] = session
-        if not self._write(msg):
-            # `close` ran between the check above and the write.
+        try:
+            written = self._write(msg)
+        except BaseException:
+            # A write that fails for another reason than a closed pipe leaves nothing pending either.
+            with self._lock:
+                self._pending.pop(msg_id, None)
+            raise
+        if not written:
+            # `close` ran between the check above and the write, or the browser closed its end.
             with self._lock:
                 self._pending.pop(msg_id, None)
             raise self._closed_error()
@@ -683,13 +710,60 @@ class Connection(EventListeners):
 
     def _write(self, msg: dict) -> bool:
         """Writes one message; False, writing nothing, once `close` has
-        released the write end (see `__init__`)."""
+        released the write end (see `__init__`) or the browser has closed its
+        end of the pipe.
+
+        ⛔ THE ONE PLACE A WRITE CAN FAIL BECAUSE THE BROWSER IS GONE. An engine
+        that dies between the check at the top of `send_placed` (or the one of
+        `launch`) and this write, before the reader has seen the end of its
+        pipe, used to leave `os.write` raising a bare `BrokenPipeError`: it
+        came out of `BrowserType.launch` as "[Errno 32] Broken pipe", with
+        neither the exit code nor the last lines of the engine, which are the
+        only account of why it stopped, and nothing a client could tell from a
+        bug of its own (seen once in the e2e of the wrapper on a hosted runner,
+        2026-11-12, while 640 other launches of the same run were good). A pipe the other end has closed is the same fact as a
+        closed one, so it gets the same answer: False, which every caller turns
+        into `_closed_error()` (exit code, last output, `TargetClosedError`,
+        the word a client's rerun rules recognise), or ignores (`post`). The
+        error that the write itself raised is kept as the reason head."""
         data = json.dumps(msg).encode("utf-8") + NUL
         with self._write_lock:
             if self._to_browser < 0:
                 return False
-            os.write(self._to_browser, data)
-        return True
+            try:
+                os.write(self._to_browser, data)
+                return True
+            except OSError as exc:
+                failure = exc
+        # Decided outside the write lock: the wait below is not a reason to hold the other writers.
+        if not (_is_a_closed_pipe(failure)
+                or (_IS_WINDOWS and failure.errno == errno.EINVAL and self._engine_is_gone(_GONE_WAIT))):
+            raise failure
+        with self._lock:                     # the reader writes the same field, under the same lock
+            if self._error is None:
+                self._error = failure
+        return False
+
+    def _engine_is_gone(self, wait: float) -> bool:
+        """True once the engine has exited or the reader has seen the end of its stream, waiting up to `wait` seconds for it.
+
+        Only the error branch of a write asks, and only for an error that does not say by itself that the pipe is closed (EINVAL
+        on Windows). The window is real: the pipe is already closed while `poll()` still says None, so a bare `poll()` would turn
+        the very case this is for into a rethrown EINVAL. A process that is alive and a reader that still reads are the proof
+        that the error is something else, and then the caller raises it as it came."""
+        deadline = time.monotonic() + wait
+        while True:
+            if self._closed:
+                return True
+            if self._process is not None:
+                try:
+                    if self._process.poll() is not None:
+                        return True
+                except Exception:
+                    pass
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
 
     def close(self, timeout: float = 5.0) -> None:
         """Closes the pipe and waits for the browser to exit on its own.
@@ -997,31 +1071,70 @@ def _spawn_windows(executable, argv, env):
             msvcrt.open_osfhandle(our_read, os.O_RDONLY), p)
 
 
+class _PosixProcess:
+    """The things `launch` and `Connection.close` ask of a process, over a pid that `os.posix_spawn` gave: `pid`, `poll()`,
+    `returncode`, `wait()`, `terminate()`, `kill()`, `stdout` (the surface the `Popen` used to have, and `_WindowsProcess` has)."""
+
+    def __init__(self, pid: int, stdout) -> None:
+        self.pid = pid
+        self.stdout = stdout
+        self.returncode: Optional[int] = None
+        self._lock = threading.Lock()
+
+    def poll(self) -> Optional[int]:
+        with self._lock:
+            if self.returncode is None:
+                try:
+                    done, status = os.waitpid(self.pid, os.WNOHANG)
+                except ChildProcessError:
+                    # waiting for children is disabled for this process (SIGCHLD ignored): the child is gone, its status is not
+                    # knowable; `Popen` says 0.
+                    self.returncode = 0
+                else:
+                    if done == self.pid:
+                        self.returncode = os.waitstatus_to_exitcode(status)
+            return self.returncode
+
+    def wait(self, timeout: Optional[float] = None) -> int:
+        end = None if timeout is None else time.monotonic() + timeout
+        delay = 0.0005
+        while True:
+            code = self.poll()
+            if code is not None:
+                return code
+            if end is not None and time.monotonic() >= end:
+                raise subprocess.TimeoutExpired(str(self.pid), timeout or 0)
+            time.sleep(delay)
+            delay = min(delay * 2, 0.05)
+
+    def _signal(self, number: int) -> None:
+        if self.poll() is None:
+            try:
+                os.kill(self.pid, number)
+            except ProcessLookupError:
+                pass
+
+    def terminate(self) -> None:
+        self._signal(signal.SIGTERM)
+
+    def kill(self) -> None:
+        self._signal(signal.SIGKILL)
+
+
 def _spawn_posix(executable, argv, env):
-    """⛔ IT WAS BROKEN, AND THE DOCSTRING HAD GUESSED WHICH HALF.
+    """Starts the engine with its Juggler pipe on descriptors 3 (it reads) and 4 (it writes).
 
-    This leg was written from `nsRemoteDebuggingPipe.cpp` and never executed
-    until 2026-08-28. The symptom on the first run: the browser starts, prints
-    `Juggler listening to the pipe`, stays alive - and the very first write
-    raises `BrokenPipeError`. A live process with no reader on the other end.
+    `nsRemoteDebuggingPipe.cpp` does not look the numbers up: 3 and 4 are hard-wired in the engine. So the child's descriptor table
+    is made by the SPAWN itself (`os.posix_spawn` with file actions: `dup2` of the two pipe ends onto 3 and 4, of the output pipe onto
+    1 and 2, and a close of every inherited descriptor above 4), and no Python runs in the child: nothing depends on what the
+    parent has open, and a launch from one of the server's worker threads, with other threads alive in the parent, cannot meet a
+    lock that one of them held at the fork (the documented danger of `preexec_fn`).
 
-    ⛔ THE CAUSE, MEASURED RATHER THAN REASONED. CPython's close-all-fds
-    sweep runs AFTER `preexec_fn`, so the two descriptors this function creates
-    with `dup2` are closed again before `exec` unless they are in the keep
-    list. A four-line experiment reported it exactly:
-
-        with preexec_fn + pass_fds(its_read, its_write) ->  alive=[3]
-        with 3 and 4 also kept                          ->  alive=[3, 4]
-
-    Fd 3 survived only by accident: the first `os.pipe()` in the parent
-    happened to return 3, so it was already in the keep list and the `dup2`
-    onto it was a no-op. Fd 4 was created by `dup2` and swept away - which is
-    why the browser could ANNOUNCE itself (it had a read end on 3) and never
-    receive anything (nothing owned the read end of OUR pipe once 4 died).
-
-    ⛔ The remedy is to name 3 and 4 in `pass_fds` as well. They are not open
-    in the parent and do not have to be: that list is a set of NUMBERS the
-    child's sweep spares, not a set of parent handles.
+    ⛔ IT USED TO DEPEND ON THE PARENT, and failed only sometimes. The call named 3 and 4 in `pass_fds`, which CPython makes inheritable in
+    the child BEFORE `preexec_fn` runs: a number that is not open in the parent fails the launch with `[Errno 9] Bad file
+    descriptor`. It worked when the two pipes the parent had just made happened to be on 3 and 4 (a bare shell) and failed when
+    they were not and 3 or 4 was closed (under a wrapper that leaves other descriptors open, such as `xvfb-run`). 3 and 4 were in the
+    list only because `close_fds` closes, after `preexec_fn`, whatever is not in it.
     """
     # ⛔ THE ENGINE IS DECLARED WHERE IT STARTS. On Windows the spawn is
     # `CreateProcessW` through ctypes, which raises none of the audit events
@@ -1032,43 +1145,54 @@ def _spawn_posix(executable, argv, env):
     # `invisible_core.testing.world` refuses it outside an e2e test, and a hook
     # that raises stops the spawn before anything is created.
     sys.audit(LAUNCH_EVENT, executable, argv)
+    import fcntl
+
+    def above_four(fd: int) -> int:
+        # A pipe end that is itself on 3 or 4 would be overwritten by the `dup2` of another: they are moved first.
+        if fd >= 5:
+            return fd
+        moved = fcntl.fcntl(fd, fcntl.F_DUPFD_CLOEXEC, 5)
+        os.close(fd)
+        return moved
+
     its_read, our_write = os.pipe()
     our_read, its_write = os.pipe()
-
-    def fix_descriptors():
-        # On POSIX the numbers are HARDWIRED in the C++: 3 for reading,
-        # 4 for writing. `nsRemoteDebuggingPipe.cpp` does not look them up.
-        #
-        # ⛔ AND 3 AND 4 *ARE* IN `pass_fds`. This comment used to say they
-        # could not be, on the reasoning that the list names fds the parent
-        # hands down. That reasoning was wrong: the list is a set of NUMBERS
-        # the child spares during its close sweep, and the sweep runs AFTER
-        # `preexec_fn` - measured, not assumed. Without them the browser starts
-        # with nothing on 4 and the first write gets EPIPE from a live
-        # process.
-        #
-        # `dup2` clears CLOEXEC on the NEW descriptor, which is what saves this
-        # in the ordinary case - but only when the source and target differ.
-        # `dup2(fd, fd)` is documented to be a no-op that does NOT clear it, so
-        # a pipe that happens to land on 3 or 4 would be closed at exec while
-        # every other run works. The explicit `set_inheritable` below removes
-        # that difference instead of relying on which fds the OS handed out.
-        for source, target in ((its_read, 3), (its_write, 4)):
-            if source != target:
-                os.dup2(source, target)
-            os.set_inheritable(target, True)
-
-    p = subprocess.Popen([executable] + argv, env=env,
-                         preexec_fn=fix_descriptors,
-                         # ⛔ 3 and 4 ARE IN THIS LIST, see the docstring.
-                         # Without them the sweep that runs after `preexec_fn`
-                         # closes exactly the two descriptors this whole
-                         # function exists to create.
-                         pass_fds=(its_read, its_write, 3, 4),
-                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    os.close(its_read)
-    os.close(its_write)
-    return our_write, our_read, p
+    out_read, out_write = os.pipe()
+    its_read, its_write, out_write = above_four(its_read), above_four(its_write), above_four(out_write)
+    try:
+        for attempt in (1, 2):
+            actions = [(os.POSIX_SPAWN_DUP2, its_read, 3), (os.POSIX_SPAWN_DUP2, its_write, 4),
+                       (os.POSIX_SPAWN_DUP2, out_write, 1), (os.POSIX_SPAWN_DUP2, out_write, 2)]
+            # What close_fds did: every descriptor the parent has open and INHERITABLE is closed in the child (the ones Python
+            # makes are not inheritable and go at `exec`; these are the ones the parent was started with). A descriptor that
+            # another thread closes between this list and the spawn fails the spawn with EBADF: the list is made again once.
+            try:
+                listed = [int(name) for name in os.listdir("/dev/fd") if name.isdigit()]
+            except OSError:
+                listed = []
+            for fd in listed:
+                if fd > 4:
+                    try:
+                        if os.get_inheritable(fd):
+                            actions.append((os.POSIX_SPAWN_CLOSE, fd))
+                    except OSError:
+                        pass
+            try:
+                pid = os.posix_spawn(executable, [executable] + argv, env, file_actions=actions,
+                                     setsigdef=[getattr(signal, name) for name in ("SIGPIPE", "SIGXFSZ") if hasattr(signal, name)])
+                break
+            except OSError as error:
+                if error.errno != errno.EBADF or attempt == 2:
+                    raise
+    except BaseException:
+        for fd in (our_write, our_read, out_read):
+            os.close(fd)
+        raise
+    finally:
+        os.close(its_read)
+        os.close(its_write)
+        os.close(out_write)
+    return our_write, our_read, _PosixProcess(pid, os.fdopen(out_read, "rb"))
 
 
 #: The audit event the engine's two spawns raise before the process is
@@ -1080,9 +1204,17 @@ LAUNCH_EVENT = "invisible_core.engine.launch"
 def launch(executable: str, profile_dir: str, *, headless: bool = True,
           argv_extra: Optional[list] = None, env: Optional[dict] = None,
           ready_timeout: Optional[float] = 60.0,
-          proxy: Optional[dict] = None) -> Connection:
+          proxy: Optional[dict] = None,
+          locale: Optional[str] = None) -> Connection:
     """Launches Firefox over the pipe and returns an already-ready
     connection.
+
+    ⛔ `env` IS RAW MATERIAL, and this is where the environment of the process is BORN
+    (`_engine_env.compose`): what the host's carries of the engine's families (`MOZ_*`, the GL and
+    toolkit ones), of the zone and of the language never reaches the engine, whoever built `env`
+    (`None` is `os.environ`; the served path hands the client's), and the core writes its own over it.
+    `locale` is the session's language (`intl.locale.requested`), from which `LANG`, `LC_ALL` and
+    `LANGUAGE` are written; none declared, none written.
 
     `ready_timeout` is the caller's launch timeout, in seconds, and it bounds
     the whole startup: the readiness line, the proxy below, and whatever the
@@ -1090,7 +1222,10 @@ def launch(executable: str, profile_dir: str, *, headless: bool = True,
     None is no limit, which is what Playwright's `launch(timeout=0)` asks.
 
     `proxy` is the `Browser.setBrowserProxy` command
-    (`parse_proxy(...).as_engine_command()`), sent before any page exists.
+    (`parse_proxy(...).as_engine_command()`), sent before any page exists and
+    FIRST; without one the explicit `Browser.setNoBrowserProxy` is sent
+    instead, because the engine holds its proxied channels until it hears
+    which of the two the session is.
     ⛔ A PROXY THAT CANNOT BE SET CLOSES THE BROWSER: until 2026-08-30 `proxy=`
     was accepted and dropped for every scheme the engine prefs do not carry,
     and a page resolved its own DNS and went out on the host address while the
@@ -1109,7 +1244,7 @@ def launch(executable: str, profile_dir: str, *, headless: bool = True,
     argv += list(argv_extra or [])
     argv.append("-silent")
 
-    full_env = dict(os.environ if env is None else env)
+    full_env = _engine_env.compose(os.environ if env is None else env, locale)
     spawn = _spawn_windows if sys.platform == "win32" else _spawn_posix
     to_browser, from_browser, p = spawn(executable, argv, full_env)
 
@@ -1148,18 +1283,25 @@ def launch(executable: str, profile_dir: str, *, headless: bool = True,
     c.ready_seen = seen
     c.output = output
     c._startup = deadline
-    if proxy is not None:
-        try:
+    # ⛔ THE FIRST COMMAND, ALWAYS. The engine's Juggler holds every proxied channel until it has been told what the
+    # session's proxy is: `Browser.setBrowserProxy`, or the explicit `Browser.setNoBrowserProxy` for a session without
+    # one. Both travel on the pipe only: a credential in the browser's environment or command line is readable by other
+    # processes of the user.
+    try:
+        if proxy is not None:
             c.startup_send("Browser.setBrowserProxy", proxy)
-        except ReplyTimeout:
-            c.close()
-            raise
-        except ProtocolError as exc:
-            c.close()
-            raise ProtocolError(
-                "the engine refused the proxy, so the browser was closed "
-                "rather than left running without one: %s" % exc) from exc
-        except BaseException:
-            c.close()
-            raise
+        else:
+            c.startup_send("Browser.setNoBrowserProxy", {})
+    except ReplyTimeout:
+        c.close()
+        raise
+    except ProtocolError as exc:
+        c.close()
+        what = "the proxy" if proxy is not None else "the session's 'no proxy'"
+        raise ProtocolError(
+            "the engine refused %s, so the browser was closed "
+            "rather than left running without one: %s" % (what, exc)) from exc
+    except BaseException:
+        c.close()
+        raise
     return c

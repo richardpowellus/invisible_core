@@ -29,6 +29,7 @@ from __future__ import annotations
 import time
 from typing import Optional
 
+from .. import _floats
 from . import _pacing
 from .connection import ReplyTimeout
 from .deadline import Deadline
@@ -127,9 +128,18 @@ class Actions:
     #: outside a commit. See `_act_on_target`.
     _landing_target = None
 
+    #: ⛔ THE BUTTONS THE MOUSE HOLDS DOWN, as the `buttons` bitmask (left 1,
+    #: right 2, middle 4). It is the state of the mouse, so it lives here: set
+    #: by `mouse_down`, cleared by `mouse_up`, and carried by every move that
+    #: does not name its own. Without it a drag (down, move, up) reached the
+    #: page as moves with `event.buttons === 0` - sliders and canvases never
+    #: followed, and no real device or stock Playwright says that. A class
+    #: default for a bench that builds this object without `__init__`.
+    _pressed = 0
+
     def __init__(self, connection, session: str, lifecycle, injected, *,
                  acts, session_seed=None, motion_budget_s=None,
-                 engine_approach: bool = False):
+                 engine_approach: bool = False, layout: str = "us"):
         self.c = connection
         self.engine_approach = engine_approach
         self.session = session
@@ -183,8 +193,11 @@ class Actions:
         #: the state of the modifiers. Building one per action would lose
         #: "Shift is down" between a `down` and the next key, and
         #: `Shift+a` would type `a`.
+        #: The keyboard this persona types on (`keyboard.layout_for`, from the
+        #: session's language): which key a character is, with which modifiers.
         self.keyboard = Keyboard(connection, session, self.typing_persona,
-                                 acts=acts, latency=self.input_latency)
+                                 acts=acts, latency=self.input_latency,
+                                 layout=layout)
         #: The last pointer position. Used by the wheel and by drag and
         #: drop, which start from where the mouse IS - not from 0,0.
         self.position = (0.0, 0.0)
@@ -266,8 +279,8 @@ class Actions:
         if isinstance(position, dict) and "x" in position and "y" in position:
             return (min(p["x"] for p in points) + float(position["x"]),
                     min(p["y"] for p in points) + float(position["y"]))
-        return (sum(p["x"] for p in points) / 4.0,
-                sum(p["y"] for p in points) / 4.0)
+        return (_floats.exact_sum(p["x"] for p in points) / 4.0,
+                _floats.exact_sum(p["y"] for p in points) / 4.0)
 
     # ── the loop ────────────────────────────────────────────────────────────
     def _retry(self, selector: str, run, *, states=None,
@@ -380,12 +393,26 @@ class Actions:
                     # it lands outside - then the loop recomputes, because the
                     # geometry has just changed underneath.
                     point = self._center_point(f, element, position, deadline)
-                    if point is not None and not self._in_viewport(point):
-                        if self.inj.scroll_into_view(f, element):
+                    # ⛔ A FRAME'S ELEMENT IS ASKED OF THE ENGINE EVEN WHEN ITS POINT IS INSIDE THE MAIN VIEWPORT. The point is in
+                    # the main frame's space, where an element that a scrolled frame has pushed out of ITS OWN viewport, or a
+                    # frame that its parent has scrolled out of view, still has coordinates inside the main viewport; the
+                    # click then aimed at a place the frame does not show, and the hit test answered `<html>`. The engine's
+                    # command is "only if needed" and looks at the element's frame and every frame above it (across
+                    # processes), so it is the one to ask; for the main frame the viewport test is the whole question.
+                    if point is not None and (f != self.lifecycle.main_frame or not self._in_viewport(point)):
+                        # The point asked for, when there is one: the engine
+                        # brings that rect of the element into view.
+                        rect = ({"x": float(position["x"]), "y": float(position["y"]),
+                                 "width": 0, "height": 0}
+                                if isinstance(position, dict) and "x" in position
+                                and "y" in position else None)
+                        self.inj.scroll_into_view(f, element, rect)
+                        moved = self._center_point(f, element, position, deadline)
+                        if moved is not None and moved != point:
                             reason = ("the element was outside the viewport; "
                                       "scrolled it in and starting over")
                             continue
-                        point = self._center_point(f, element, position, deadline)
+                        point = moved
                     if point is None:
                         reason = "the element has no quad (it isn't visible)"
                     elif trial:
@@ -512,15 +539,31 @@ class Actions:
         answers `<html>` - which is how a covered element used to be reported
         for something sitting right under the pointer.
 
-        The shift is the difference between the two content origins, read from
-        the engine rather than recomputed here.
+        The shift is where the frame's viewport starts in the main frame's,
+        read from the engine rather than recomputed here: the page's own
+        `mozInnerScreen*` is the same in every process of the window, so a
+        frame of another process cannot be placed with it.
         """
         if f == self.lifecycle.main_frame:
             return point
-        main = self.inj.content_origin(self.lifecycle.main_frame)
-        here = self.inj.content_origin(f)
-        return (point[0] + main["x"] - here["x"],
-                point[1] + main["y"] - here["y"])
+        here = self.inj.frame_origin(f)
+        dx, dy = point[0] - here["x"], point[1] - here["y"]
+        # ⛔ A SHIFT IS ENOUGH ONLY WHILE NOTHING TRANSFORMS THE FRAME. Under a CSS
+        # scale or skew on the `<iframe>` (or on something above it) the main
+        # frame's pixel is not the frame's pixel plus an offset, and the shift
+        # alone asked the frame about another place: `<button r1c0>` or `<html>`
+        # for a click that was aimed, and landed, on the right element. The
+        # engine says where one pixel along the frame's x and y goes in the main
+        # frame (`ex`, `ey`), and the point is taken back through that 2x2.
+        # An engine that does not send them is one that only knows the shift.
+        ex, ey = here.get("ex"), here.get("ey")
+        if not ex or not ey:
+            return (dx, dy)
+        det = ex["x"] * ey["y"] - ey["x"] * ex["y"]
+        if abs(det) < 1e-9:           # a frame flattened to a line shows no point of its own
+            return (dx, dy)
+        return ((dx * ey["y"] - dy * ey["x"]) / det,
+                (ex["x"] * dy - ex["y"] * dx) / det)
 
     def _act_on_target(self, f, element, point, *, approach, commit,
                        force: bool = False,
@@ -613,11 +656,21 @@ class Actions:
         # turn. A question asked afterwards (`Page.pointerLanded`, until
         # firefox-39) met whatever the page had become by then - a submit that
         # navigated had already taken the element away. [B230]
-        self._landing_target, self._landings = (f, element), {}
+        #
+        # ⛔ AND THE NODE IT NAMES IS THE TREE THE EVENT WILL LAND IN. The
+        # engine judges with `contains`, which stops at a shadow boundary, so a
+        # web component's own `<button>` or icon read as a miss of the
+        # component (`Injected.landing_scope`). When the point is inside a
+        # shadow tree that is inside the element, that tree's root is named
+        # instead; otherwise the element, as before.
+        scope = self.inj.landing_scope(f, element, self._hit_point(f, point))
+        self._landing_target, self._landings = (f, scope or element), {}
         try:
             result = commit()
         finally:
             self._landing_target = None
+            if scope:
+                self.inj.dispose(f, scope)
         landings = self._landings
         # ⛔ A DIALOG THE ACTION OPENED ENDS THE ENGINE'S WAIT with no verdict:
         # the page's process is inside the dialog, and the dialog is the proof
@@ -1002,7 +1055,7 @@ class Actions:
         return self._retry(selector, run, timeout=timeout,
                            frame_id=frame_id, position=position, **opts)
 
-    def _approach(self, point, *, buttons: int = 0, modifiers: int = 0,
+    def _approach(self, point, *, buttons: Optional[int] = None, modifiers: int = 0,
                   stop_short: bool = False) -> int:
         """Bring the pointer to *point* before an action.
 
@@ -1026,12 +1079,12 @@ class Actions:
         return self._glide(point, buttons=buttons, modifiers=modifiers,
                            stop_short=stop_short)
 
-    def glide_to(self, x: float, y: float, *, buttons: int = 0) -> int:
+    def glide_to(self, x: float, y: float, *, buttons: Optional[int] = None) -> int:
         """Move the pointer to (x, y) along a drawn path. For callers that
         drive the pointer directly, such as Selenium's ActionChains."""
         return self._glide((x, y), buttons=buttons)
 
-    def _glide(self, to_point, *, buttons: int = 0, modifiers: int = 0,
+    def _glide(self, to_point, *, buttons: Optional[int] = None, modifiers: int = 0,
                stop_short: bool = False) -> int:
         """Move the pointer to *to_point* along a path a hand could have drawn.
 
@@ -1168,15 +1221,22 @@ class Actions:
         for i in range(1, max(1, steps) + 1):
             self._mouse_event("mousemove",
                               (x0 + (x - x0) * i / steps,
-                               y0 + (y - y0) * i / steps))
+                               y0 + (y - y0) * i / steps),
+                              buttons=self._pressed)
 
     def mouse_down(self, *, button: int = 0, clicks: int = 1) -> None:
+        pressed = self._pressed | BUTTON_MASK[button]
         self._mouse_event("mousedown", self.position, button=button,
-                          buttons=BUTTON_MASK[button], click_count=clicks)
+                          buttons=pressed, click_count=clicks)
+        self._pressed = pressed
 
     def mouse_up(self, *, button: int = 0, clicks: int = 1) -> None:
+        # The release's `buttons` is what stays pressed AFTERWARD: with the
+        # left and the right down, letting go of one leaves the other.
+        pressed = self._pressed & ~BUTTON_MASK[button]
         self._mouse_event("mouseup", self.position, button=button,
-                          buttons=0, click_count=clicks)
+                          buttons=pressed, click_count=clicks)
+        self._pressed = pressed
 
     def click_at(self, x: float, y: float, *, button: int = 0,
                 clicks: int = 1, delay_ms: Optional[float] = None):
@@ -1213,11 +1273,12 @@ class Actions:
         for n in range(1, clicks + 1):
             dwell_ms, gap_ms = plan[n - 1]
             self._mouse_event("mousedown", point, button=button,
-                              buttons=BUTTON_MASK[button], click_count=n,
-                              modifiers=modifiers)
+                              buttons=self._pressed | BUTTON_MASK[button],
+                              click_count=n, modifiers=modifiers)
             if dwell_ms > 0.0:
                 time.sleep(dwell_ms / 1000.0)
-            self._mouse_event("mouseup", point, button=button, buttons=0,
+            self._mouse_event("mouseup", point, button=button,
+                              buttons=self._pressed & ~BUTTON_MASK[button],
                               click_count=n, modifiers=modifiers)
             if gap_ms > 0.0:
                 time.sleep(gap_ms / 1000.0)
@@ -1401,8 +1462,10 @@ class Actions:
 
     # ── the tools ───────────────────────────────────────────────────────────
     def _mouse_event(self, event_type: str, point, *, button: int = 0,
-                     buttons: int = 0, click_count: Optional[int] = None,
+                     buttons: Optional[int] = None, click_count: Optional[int] = None,
                      modifiers: int = 0):
+        if buttons is None:
+            buttons = self._pressed
         p = {"type": event_type, "x": point[0], "y": point[1],
              "button": button, "buttons": buttons,
              # The modifiers come from the KEYBOARD unless the caller
