@@ -1,6 +1,6 @@
 """Unit tests for `invisible_core._geo` (timezone="auto" resolution).
 
-Covers: the precedence policy (resolve_session_timezone), proxy→requests
+Covers: the precedence policy (prepare_session_geo), proxy→requests
 translation, egress IP discovery (mocked HTTP), and IP→IANA mapping (mocked
 mmdb). No real network or mmdb is touched.
 """
@@ -34,7 +34,6 @@ from invisible_core._geo import (
     ip_to_coordinates,
     ip_to_timezone,
     prepare_session_geo,
-    resolve_session_timezone,
 )
 
 SOCKS = {"server": "socks5://gw.example:1080", "username": "u", "password": "p"}
@@ -153,7 +152,7 @@ def test_discover_egress_ip_first_endpoint_wins(monkeypatch):
         calls.append(url)
         return _FakeResp("203.0.113.7\n")
 
-    monkeypatch.setattr(_geo.requests, "get", fake_get)
+    monkeypatch.setattr(_geo, "_http_get", fake_get)
     assert discover_egress_ip(SOCKS) == "203.0.113.7"
     assert len(calls) == 1  # stopped at the first success
 
@@ -165,7 +164,7 @@ def test_discover_egress_ip_falls_through_to_next_on_error(monkeypatch):
     def fake_get(url, **kw):
         return next(seq)
 
-    monkeypatch.setattr(_geo.requests, "get", fake_get)
+    monkeypatch.setattr(_geo, "_http_get", fake_get)
     assert discover_egress_ip(HTTP) == "198.51.100.42"
 
 
@@ -174,7 +173,7 @@ def test_discover_egress_ip_all_fail_raises(monkeypatch):
     def fake_get(url, **kw):
         raise OSError("connection refused")
 
-    monkeypatch.setattr(_geo.requests, "get", fake_get)
+    monkeypatch.setattr(_geo, "_http_get", fake_get)
     with pytest.raises(GeoTimezoneError):
         discover_egress_ip(SOCKS)
 
@@ -188,7 +187,7 @@ def test_discover_egress_ip_no_proxy_is_direct(monkeypatch):
         seen["proxies"] = kw.get("proxies", "MISSING")
         return _FakeResp("192.0.2.55")
 
-    monkeypatch.setattr(_geo.requests, "get", fake_get)
+    monkeypatch.setattr(_geo, "_http_get", fake_get)
     assert discover_egress_ip(None) == "192.0.2.55"
     assert seen["proxies"] is None
 
@@ -310,7 +309,7 @@ def test_a_session_without_coordinates_still_resolves_its_timezone(monkeypatch):
 
 
 # ──────────────────────────────────────────────────────────────────────
-#  resolve_session_timezone - the precedence policy
+#  prepare_session_geo - the timezone precedence policy
 # ──────────────────────────────────────────────────────────────────────
 @pytest.fixture
 def stub_egress(monkeypatch):
@@ -324,8 +323,8 @@ def stub_egress(monkeypatch):
 
     monkeypatch.setattr(_geo, "discover_egress_ip", fake_discover)
     monkeypatch.setattr(_geo, "ip_to_timezone", lambda ip, mmdb: "America/New_York")
-    # ensure_geoip_mmdb is imported from .download at call time
-    import invisible_core.download as dl
+    # ensure_geoip_mmdb is a name of _geo, where the launch reads it
+    import invisible_core._geo as dl
 
     monkeypatch.setattr(dl, "ensure_geoip_mmdb", lambda *a, **k: "fake.mmdb")
     return state
@@ -333,43 +332,43 @@ def stub_egress(monkeypatch):
 
 @pytest.mark.unit
 def test_resolve_explicit_iana_wins(stub_egress):
-    # An explicit zone wins and never triggers resolution (proxy or not).
-    assert resolve_session_timezone("Asia/Tokyo", SOCKS) == "Asia/Tokyo"
-    assert resolve_session_timezone("Asia/Tokyo", None) == "Asia/Tokyo"
-    assert stub_egress["called"] is False
+    # An explicit zone wins over the egress (proxy or not): the egress is
+    # still asked, for the language and the position, and never for the zone.
+    assert prepare_session_geo("Asia/Tokyo", SOCKS).timezone == "Asia/Tokyo"
+    assert prepare_session_geo("Asia/Tokyo", None).timezone == "Asia/Tokyo"
 
 
 @pytest.mark.unit
 def test_resolve_empty_with_proxy_resolves_from_proxy(stub_egress):
-    assert resolve_session_timezone("", SOCKS) == "America/New_York"
+    assert prepare_session_geo("", SOCKS).timezone == "America/New_York"
     assert stub_egress["called"] is True
     assert stub_egress["proxy_arg"] == SOCKS  # routed through the proxy
 
 
 @pytest.mark.unit
 def test_resolve_auto_with_proxy_resolves_from_proxy(stub_egress):
-    assert resolve_session_timezone("auto", HTTP) == "America/New_York"
+    assert prepare_session_geo("auto", HTTP).timezone == "America/New_York"
     assert stub_egress["proxy_arg"] == HTTP
 
 
 @pytest.mark.unit
 def test_resolve_empty_no_proxy_resolves_from_host(stub_egress):
     # auto ALWAYS resolves - without a proxy, from the host's own public IP.
-    assert resolve_session_timezone("", None) == "America/New_York"
+    assert prepare_session_geo("", None).timezone == "America/New_York"
     assert stub_egress["called"] is True
     assert stub_egress["proxy_arg"] is None  # direct request, no proxy
 
 
 @pytest.mark.unit
 def test_resolve_auto_no_proxy_resolves_from_host(stub_egress):
-    assert resolve_session_timezone("auto", None) == "America/New_York"
+    assert prepare_session_geo("auto", None).timezone == "America/New_York"
     assert stub_egress["proxy_arg"] is None
 
 
 @pytest.mark.unit
 def test_resolve_direct_proxy_resolves_via_host(stub_egress):
     # direct:// counts as "no proxy" → resolve from the host IP, don't skip.
-    assert resolve_session_timezone("auto", {"server": "direct://"}) == "America/New_York"
+    assert prepare_session_geo("auto", {"server": "direct://"}).timezone == "America/New_York"
     assert stub_egress["proxy_arg"] is None
 
 
@@ -383,9 +382,9 @@ def test_resolve_no_proxy_failure_raises_instead_of_using_the_host_zone(monkeypa
 
     monkeypatch.setattr(_geo, "discover_egress_ip", boom)
     with pytest.raises(GeoTimezoneError):
-        resolve_session_timezone("auto", None)
+        prepare_session_geo("auto", None)
     with pytest.raises(GeoTimezoneError):
-        resolve_session_timezone("", None)
+        prepare_session_geo("", None)
 
 
 @pytest.mark.unit
@@ -396,9 +395,9 @@ def test_resolve_proxy_failure_raises(monkeypatch):
 
     monkeypatch.setattr(_geo, "discover_egress_ip", boom)
     with pytest.raises(GeoTimezoneError):
-        resolve_session_timezone("auto", SOCKS)
+        prepare_session_geo("auto", SOCKS)
     with pytest.raises(GeoTimezoneError):
-        resolve_session_timezone("", SOCKS)
+        prepare_session_geo("", SOCKS)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -432,13 +431,6 @@ def test_prepare_geo_carries_the_exit_without_proxy(stub_egress):
     geo = prepare_session_geo("auto", None)
     assert geo.timezone == "America/New_York"
     assert geo.egress_ip == "203.0.113.7"
-
-
-@pytest.mark.unit
-def test_prepare_geo_timezone_matches_resolve_session_timezone(stub_egress):
-    # the thin tz wrapper must stay equivalent to prepare_session_geo().timezone
-    for tz, proxy in [("Asia/Tokyo", SOCKS), ("auto", HTTP), ("", None)]:
-        assert prepare_session_geo(tz, proxy).timezone == resolve_session_timezone(tz, proxy)
 
 
 # ---------------------------------------------------------------------------
@@ -504,7 +496,7 @@ def test_a_single_endpoint_cannot_eat_the_whole_budget(monkeypatch):
         seen.append(kw.get("timeout"))
         raise RuntimeError("this endpoint stays silent")
 
-    monkeypatch.setattr(_geo.requests, "get", _get)
+    monkeypatch.setattr(_geo, "_http_get", _get)
 
     with pytest.raises(_geo.GeoTimezoneError):
         _geo.discover_egress_ip(None, timeout=10.0, budget=15.0)
@@ -528,7 +520,7 @@ def test_a_single_endpoint_cannot_eat_the_whole_budget(monkeypatch):
 
 def _count_probes(monkeypatch):
     """Makes discovery deterministic and COUNTS how many times it is called."""
-    import invisible_core.download as dl
+    import invisible_core._geo as dl
     from invisible_core import _geo
 
     count = {"n": 0}

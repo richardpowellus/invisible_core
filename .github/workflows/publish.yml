@@ -136,7 +136,7 @@ jobs:
         # The local pre-push layer is only real if .githooks is wired up. CI
         # cannot check somebody else's clone, but it can check that the wiring
         # this repo ships still works, so it cannot rot unnoticed.
-        run: python scripts/install_hooks.py --check || python scripts/install_hooks.py
+        run: python -m invisible_core.hooks install --check || python -m invisible_core.hooks install
       - name: the suite
         # A TAG push does not trigger the ordinary test workflow, which runs on
         # branches and pull requests. Without this step, tagging is a way of
@@ -161,7 +161,7 @@ jobs:
         # Only 0 continues, and --verify-index makes the ledger's claim get
         # checked against what the index actually serves.
         run: >
-          python scripts/version_gate.py check --verify-index
+          python -m invisible_core.release check --verify-index
           ${{ (github.event_name == 'workflow_dispatch' && inputs.first_release) && '--first-release' || '' }}
 
   upload:
@@ -181,7 +181,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install --upgrade pip build hatchling twine
-      - run: python -m pip install -e . --quiet   # version_gate imports the package
+      - run: python -m pip install -e . --quiet   # the gate is a module of the package
       - name: gate, upload, record
         # Not `twine upload` directly: `publish` re-runs the gate in-process and
         # returns its exit code without reaching twine on a refusal, and it
@@ -189,7 +189,7 @@ jobs:
         # in dist/. Belt and braces with `needs: gate` on purpose - this job is
         # the one holding the credential.
         run: >
-          python scripts/version_gate.py publish --verify-index
+          python -m invisible_core.release publish --verify-index
           --repository ${{ (github.event_name == 'workflow_dispatch' && inputs.repository) || 'pypi' }}
           ${{ (github.event_name == 'workflow_dispatch' && inputs.first_release) && '--first-release' || '' }}
       - name: commit the ledger entry

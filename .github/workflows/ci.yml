@@ -59,7 +59,7 @@ jobs:
       - name: arm the pre-push publish gate
         # A fresh clone has no core.hooksPath, and tests/test_release_wiring.py
         # says so. Do here what a developer does once.
-        run: python scripts/install_hooks.py
+        run: python -m invisible_core.hooks install
 
       - name: undefined names and duplicate definitions
         # F821 (undefined name) and F811 (redefinition) only. Not a style pass:
@@ -218,6 +218,47 @@ jobs:
           print(f"{passed} cases ran")
           PY
 
+  # THE ENGINE IS BORN INSIDE THE PROCESS'S JOB OBJECT (Windows). The spawn creates
+  # it suspended, assigns it and resumes it, so its whole tree, late children
+  # included, is in the job by construction and dies with the launching process:
+  # no machine-wide scan at launch (`LifetimeGuard.bind` was 12-29% of the
+  # launching thread, measured with py-spy on this runner). A Python process
+  # stands for the engine, because the property is the spawn's, not the
+  # browser's; the same tests run against the real engine in the wrapper's e2e
+  # (wrapper-on-this-core) and wherever INVPW_BINARY_PATH names a binary.
+  engine-born-in-the-job:
+    runs-on: windows-2022
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -e ".[dev]"
+      - name: the spawn, the late children, two launches and the killed client, also under an outer job
+        shell: bash
+        run: |
+          set -o pipefail   # or tee would swallow pytest's exit code
+          python -m pytest tests/test_the_engine_is_born_in_the_job.py -m e2e \
+            -o addopts="" -v -rs | tee job-report.txt
+      # The seven stand-in cases (two shapes of engine, two launches in one
+      # process, a killed client, and the three of a client already inside a
+      # job) or nothing: a run in which they skipped checked nothing.
+      - name: Refuse a run in which the stand-in cases did not all run
+        shell: bash
+        run: |
+          python - <<'PY'
+          import pathlib, re, sys
+          text = pathlib.Path("job-report.txt").read_text(encoding="utf-8", errors="ignore")
+          m = re.search(r"(\d+) passed", text)
+          passed = int(m.group(1)) if m else 0
+          if passed < 7:
+              print(f"only {passed} of the 7 stand-in cases ran", file=sys.stderr)
+              sys.exit(1)
+          print(f"{passed} cases ran")
+          PY
+
   # THE ARM64 WINDOWS HOST RUNS THE x86_64 ENGINE, AND THIS IS WHERE THAT IS
   # MEASURED. `EMULATED_LEGS` in seal.py declares it; before 2026-09-25 an
   # ARM64 Python - the one uv installs on Snapdragon laptops - was refused with
@@ -354,7 +395,7 @@ jobs:
       - run: python -m pip install -e ".[dev]"
       - name: arm the pre-push publish gate
         # As in `tests`: tests/test_release_wiring.py refuses an unarmed clone.
-        run: python scripts/install_hooks.py
+        run: python -m invisible_core.hooks install
       - name: the default selection, with nothing outside this process
         shell: bash
         run: |
@@ -405,7 +446,7 @@ jobs:
       - run: python -m pip install --upgrade pip
       - run: python -m pip install -e ".[dev]"
       - name: arm the pre-push publish gate
-        run: python scripts/install_hooks.py
+        run: python -m invisible_core.hooks install
       - name: the default selection, with nothing outside this process
         run: |
           $py = (python -c "import sys; print(sys.executable)").Trim()
@@ -437,13 +478,222 @@ jobs:
           print(f"{passed} tests ran with nothing outside the process")
           PY
 
+  # THE WRAPPER'S TESTS, ON THE CORE ABOUT TO BE PUBLISHED. The wrapper pins this
+  # package and is published AFTER it, so its own CI installs the PINNED core from
+  # the index: for a release of the core, no test of the wrapper that stands on the
+  # core's Juggler client (Lifecycle, InjectedScript, Connection, the protocol) had
+  # ever run on the code that was about to go out. This job checks out the wrapper's
+  # main, installs it, puts THIS checkout's core over the pin, fetches the engine
+  # the seal names and runs those test files, on Linux and Windows.
+  #
+  # WHEN: on a release pull request (head branch `release/*`), on every push to
+  # main, and on a pull request that touches the job itself (this file, the script,
+  # its table of seconds, or its test): `wrapper-job-needed` decides and says it in
+  # its output `run`. Any other pull request skips the job, and the `gate` below
+  # knows that is the right state for those and the wrong one for the others.
+  #
+  # WHICH TESTS is computed, not typed: scripts/wrapper_on_this_core.py greps the
+  # wrapper's tests for the files that import `invisible_core.juggler` or build a
+  # Lifecycle / InjectedScript / Connection by hand. It is compared, in this job,
+  # with the list MAIN's copy of that script gives on the same wrapper tree: a list
+  # that got shorter is red. A test that is skipped is red, an engine the seal
+  # names that is not published yet is red (never a skip), and so is a part that
+  # ran no file it was given.
+  #
+  # TWO PARTS ON LINUX, FOUR ON WINDOWS (six legs), planned by the seconds each test
+  # file took (scripts/wrapper_test_seconds.json; the long files are cut into nodes),
+  # the same plan on every leg. The test step has 12 minutes. The legs run the
+  # wrapper's own e2e command (invisible_core.testing.e2e: four browsers at once,
+  # the wall-clock tests alone at the end), under xvfb on Linux as the wrapper's
+  # e2e job does. INVISIBLE_CORE_PIN=allow and INVISIBLE_CORE_AUTOFIX=off: the
+  # wrapper checks its pin at import, and the repair would put the pinned core back
+  # over the one under test.
+  wrapper-job-needed:
+    name: wrapper-job-needed
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: decide
+        env:
+          EVENT: ${{ github.event_name }}
+          HEAD_REF: ${{ github.head_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # A diff that cannot be read is red (set -e), never "nothing changed".
+          set -e
+          run=false
+          if [ "$EVENT" = "push" ]; then
+            run=true
+          else
+            case "$HEAD_REF" in release/*) run=true ;; esac
+            git diff --name-only "$BASE_SHA...$HEAD_SHA" > "$RUNNER_TEMP/changed.txt"
+            while IFS= read -r path; do
+              case "$path" in
+                .github/workflows/ci.yml|scripts/wrapper_on_this_core.py|scripts/wrapper_test_seconds.json|tests/test_the_wrapper_job_runs_on_the_core.py)
+                  run=true ;;
+              esac
+            done < "$RUNNER_TEMP/changed.txt"
+          fi
+          echo "run=$run" >> "$GITHUB_OUTPUT"
+          echo "wrapper-on-this-core is needed: $run"
+
+  wrapper-on-this-core:
+    name: wrapper-on-this-core (${{ matrix.os }}, part ${{ matrix.part }})
+    needs: [wrapper-job-needed]
+    if: needs.wrapper-job-needed.outputs.run == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: linux, runner: ubuntu-24.04, part: 1, parts: 2}
+          - {os: linux, runner: ubuntu-24.04, part: 2, parts: 2}
+          - {os: windows, runner: windows-2022, part: 1, parts: 4}
+          - {os: windows, runner: windows-2022, part: 2, parts: 4}
+          - {os: windows, runner: windows-2022, part: 3, parts: 4}
+          - {os: windows, runner: windows-2022, part: 4, parts: 4}
+    defaults:
+      run:
+        shell: bash
+    env:
+      INVISIBLE_CORE_PIN: allow
+      INVISIBLE_CORE_AUTOFIX: "off"
+      PYTHONUNBUFFERED: "1"
+    steps:
+      # The core of this change. Full history: the comparison below reads the copy
+      # of the script that main (or the commit before a push) has.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: oss-invisible/playwright
+          ref: main
+          path: wrapper
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: the list of tests is not shorter than main's
+        run: |
+          # The list of main is what main's copy of the script computes on THIS wrapper
+          # tree. A base that cannot be read is red, not "main has nothing".
+          if [ "${{ github.event_name }}" = "push" ]; then
+            BASE="${{ github.event.before }}"
+          else
+            BASE="origin/main"
+          fi
+          if ! git rev-parse --verify -q "$BASE^{commit}" > /dev/null; then
+            echo "cannot read $BASE: it is not known what main has" >&2
+            exit 1
+          fi
+          if git cat-file -e "$BASE:scripts/wrapper_on_this_core.py" 2> /dev/null; then
+            git show "$BASE:scripts/wrapper_on_this_core.py" > "$RUNNER_TEMP/main_wrapper_on_this_core.py"
+            python scripts/wrapper_on_this_core.py compare --wrapper wrapper \
+              --main-script "$RUNNER_TEMP/main_wrapper_on_this_core.py"
+          else
+            python scripts/wrapper_on_this_core.py compare --wrapper wrapper --main-has-no-script
+          fi
+      - name: the wrapper, then THIS core over its pin
+        run: |
+          python -m pip install --upgrade pip
+          (cd wrapper && python -m pip install ".[dev]")
+          # Playwright only as a system tool, for the libraries Firefox needs on a bare runner.
+          python -m pip install "playwright==$(cat wrapper/scripts/playwright_pin.txt)"
+          python -m pip install --force-reinstall --no-deps .
+          python -c "import invisible_core; print('core under test:', invisible_core.__file__)"
+      - name: system libraries and a virtual display (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          sudo "$(which python)" -m playwright install-deps firefox
+      - name: the engine the seal names (published, or red)
+        run: |
+          # An assignment, not `echo "FF=$(...)"`: a failure inside a command
+          # substitution that is only an argument is lost, and "the engine is not
+          # published" must stop the job here.
+          OUT="$(cd "$RUNNER_TEMP" && python "$GITHUB_WORKSPACE/scripts/wrapper_on_this_core.py" engine)"
+          echo "FF=$(echo "$OUT" | tail -1)" >> "$GITHUB_ENV"
+      - name: the GeoIP database (made by the wrapper, same bytes every run)
+        working-directory: wrapper
+        run: python scripts/ci_lab_geoip.py build
+      - name: the wrapper's tests that stand on the core, part ${{ matrix.part }}
+        timeout-minutes: 12
+        run: |
+          RUN=(python -u scripts/wrapper_on_this_core.py run --wrapper wrapper --binary "$FF"
+               --os "${{ matrix.os }}" --part "${{ matrix.part }}" --parts "${{ matrix.parts }}" --procs 4
+               --junit-dir "$RUNNER_TEMP/wrapper-on-this-core-junit")
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            xvfb-run -a "${RUN[@]}"
+          else
+            "${RUN[@]}"
+          fi
+      # THE ENGINE'S TREE ENDS WITH ITS CLIENT, WITH THE REAL ENGINE, ON BOTH OSES. On POSIX the engine is born the leader of a
+      # process group of its own (the tree is that group), so a terminal's Ctrl+C no longer reaches it, and what ends it when its
+      # client dies is the end of the Juggler pipe (`nsRemoteDebuggingPipe`); on Windows the tree is the launch's job. Nothing but
+      # the real engine can say either holds, so the cases of tests/test_the_engine_is_born_in_the_job.py that start it run here, on
+      # the engine the seal names: the client killed (SIGKILL, TerminateProcess), a close that leaves nothing, and, on Linux only (a
+      # terminal's Ctrl+C is a POSIX signal to a process group), the client interrupted with SIGINT to its group. One part only:
+      # they are the same on all. Fewer passed than the OS has (Linux 3, Windows 2) is red: a skip checked nothing.
+      - name: the engine's tree ends with its client
+        if: matrix.part == 1
+        timeout-minutes: 8
+        env:
+          INVPW_BINARY_PATH: ${{ env.FF }}
+        run: |
+          set -o pipefail   # or tee would swallow pytest's exit code
+          CASES="test_a_killed_client_leaves_no_engine_process or test_after_close_no_process_of_the_session_is_left"
+          WANT=2
+          RUN=(python -m pytest tests/test_the_engine_is_born_in_the_job.py -m e2e -o addopts="" -v -rs -p no:cacheprovider)
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            CASES="$CASES or test_an_interrupted_client_leaves_no_engine_process"
+            WANT=3
+            RUN=(xvfb-run -a "${RUN[@]}")
+          fi
+          "${RUN[@]}" -k "$CASES" | tee tree-report.txt
+          WANT="$WANT" python - <<'PY'
+          import os, pathlib, re, sys
+          text = pathlib.Path("tree-report.txt").read_text(encoding="utf-8", errors="ignore")
+          m = re.search(r"(\d+) passed", text)
+          passed = int(m.group(1)) if m else 0
+          want = int(os.environ["WANT"])
+          if passed < want:
+              print(f"only {passed} of the {want} real-engine cases passed", file=sys.stderr)
+              sys.exit(1)
+          print(f"{passed} cases passed")
+          PY
+      - name: the leg ran with the pinned GeoIP database
+        if: always()
+        working-directory: wrapper
+        run: |
+          python scripts/ci_lab_geoip.py evidence --out "$(dirname "$GEOIP_USED_OUT")/geoip-evidence.json" > /dev/null
+          python scripts/ci_lab_geoip.py verify --evidence "$(dirname "$GEOIP_USED_OUT")/geoip-evidence.json" --used "$GEOIP_USED_OUT"
+      - name: close every Firefox left (Windows)
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Get-Process firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          "left: " + @(Get-Process firefox -ErrorAction SilentlyContinue).Count
+
   gate:
     needs: [tests, msix-host, arm64-host, branding-is-retail, repair-through-the-installer,
-            default-selection-stays-inside, default-selection-stays-inside-windows]
+            default-selection-stays-inside, default-selection-stays-inside-windows,
+            wrapper-job-needed, wrapper-on-this-core]
     if: always()
     runs-on: ubuntu-latest
     steps:
       - name: refuse unless every matrix job succeeded
+        env:
+          # The same condition as the `if:` of wrapper-on-this-core
+          # (tests/test_the_wrapper_job_runs_on_the_core.py holds the two alike).
+          WRAPPER_JOB_REQUIRED: ${{ needs.wrapper-job-needed.outputs.run == 'true' }}
         run: |
           echo "tests: ${{ needs.tests.result }}"
           echo "msix-host: ${{ needs.msix-host.result }}"
@@ -452,6 +702,8 @@ jobs:
           echo "repair-through-the-installer: ${{ needs.repair-through-the-installer.result }}"
           echo "default-selection-stays-inside: ${{ needs.default-selection-stays-inside.result }}"
           echo "default-selection-stays-inside-windows: ${{ needs.default-selection-stays-inside-windows.result }}"
+          echo "wrapper-job-needed: ${{ needs.wrapper-job-needed.result }}"
+          echo "wrapper-on-this-core: ${{ needs.wrapper-on-this-core.result }} (required: $WRAPPER_JOB_REQUIRED)"
           test "${{ needs.tests.result }}" = "success"
           test "${{ needs.msix-host.result }}" = "success"
           test "${{ needs.arm64-host.result }}" = "success"
@@ -459,3 +711,15 @@ jobs:
           test "${{ needs.repair-through-the-installer.result }}" = "success"
           test "${{ needs.default-selection-stays-inside.result }}" = "success"
           test "${{ needs.default-selection-stays-inside-windows.result }}" = "success"
+          # The decision itself must have been made: without it the job below would
+          # read as "not needed" and a skip would pass.
+          test "${{ needs.wrapper-job-needed.result }}" = "success"
+          # Required on a release pull request, on a push to main and on a pull
+          # request that touches the job: green, and a job that did not run there is
+          # red, never "skipped, so fine". Any other pull request has no reason to
+          # run it, and a skip is its right state.
+          if [ "$WRAPPER_JOB_REQUIRED" = "true" ]; then
+            test "${{ needs.wrapper-on-this-core.result }}" = "success"
+          else
+            test "${{ needs.wrapper-on-this-core.result }}" = "skipped"
+          fi
