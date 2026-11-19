@@ -1,5 +1,10 @@
 # invisible_core
 
+<p align="center">
+<a href="https://decodo.com/deals/residential-offer?utm_medium=affiliate&utm_source=Federico+Elia&promoter_id=15854270&fpr=7859773"><img alt="Decodo residential proxies, free trial (sponsored)" src="https://raw.githubusercontent.com/oss-invisible/core/main/docs/decodo-residential-proxies-trial.png" width="560"></a><br>
+<sub>Sponsored</sub>
+</p>
+
 Pure config for a patched Firefox stealth profile - **zero Playwright dependency**.
 
 `seed → fingerprint profile → Firefox prefs`, plus patched-binary download,

@@ -379,17 +379,6 @@ _MONOSPACE_LANG_GROUPS = (
 #  Baseline - applied to every session regardless of Profile.
 # ──────────────────────────────────────────────────────────────────────
 
-#: Where every session's engine reports a launch. One place; the engine's
-#: compiled default says the same, for a bare launch with no profile prefs.
-USAGE_PING_URL = ("https://github.com/oss-invisible/firefox_antidetect_patch"
-                  "/releases/download/usage-counter/launch.txt")
-
-#: The two prefs of the launch counter. They are the engine's side of a fact that is the package's: invisible-playwright counts its launches, and a
-#: caller can neither turn the counter off nor point it elsewhere. A caller that passes either one is refused, loudly (`_apply_caller_overlay`), never
-#: ignored in silence; the core writes the address itself and never writes `enabled`.
-USAGE_PING_PREFS = ("invisible_firefox.usage_ping.enabled", "invisible_firefox.usage_ping.url")
-USAGE_PING_REFUSAL = "the launch counter is part of invisible-playwright and cannot be turned off or redirected"
-
 _BASELINE: Dict[str, Any] = {
     # Turn off Firefox's own resistFingerprinting; we do our own via patches.
     # The CSS property set a page enumerates has to match retail, and ours was
@@ -477,6 +466,12 @@ _BASELINE: Dict[str, Any] = {
     #   (an e2e with a local DoH) overrides them through `extra_prefs`, which is applied last.
     "network.trr.uri":                                    "https://mozilla.cloudflare-dns.com/dns-query",
     "network.trr.bootstrapAddr":                          "162.159.61.4",
+    # Names the DoH service never sends over DoH: `localhost` only (Firefox answers it itself, 127.0.0.1 and ::1, and no
+    # lookup of it reaches the host). Firefox's own list also holds `local`, which would send every `*.local` name of a
+    # proxied session to the HOST's resolver (hosts file, DNS, and on Windows possibly a multicast query on its LAN): a
+    # page that asks for `x.local` would then read the host. Without a proxy no lookup is DoH (mode 0), so the list is
+    # inert and the lookup is native as in retail; with a proxy `*.local` goes to DoH through the proxy like any other name.
+    "network.trr.builtin-excluded-domains":               "localhost",
 
     # TLS ClientHello fingerprint - match stock Firefox byte-for-byte.
     # The Playwright/Juggler Firefox build this binary derives from re-enables
@@ -1168,6 +1163,56 @@ def _route_float_pairs(prefs: Dict[str, Any]) -> None:
 
 
 
+# Software compositing for every persona, declared by the core, the same on every machine
+# (owner's decision 2026-11-15). The decision is the one official Firefox 159 takes on a
+# Windows machine with no GPU, measured on GitHub windows-2022 (adapter Microsoft Hyper-V
+# Video 0x000b): Direct3D11 compositing and WebRender are blocklisted with
+# FEATURE_FAILURE_VM_VENDOR, and the GPU process stays up (WebGL needs it: gfxPlatform.cpp).
+# Only the compositing features are replaced; WebGL, WebGPU, media and every other feature
+# keep what the persona's real device declares. DIRECT3D_11_LAYERS is the feature behind
+# the "D3D11_COMPOSITING" line of about:support; WEBRENDER_ANGLE_METAL is OK on that runner
+# too, as every device declares it.
+_VM_FAILURE = "FEATURE_FAILURE_VM_VENDOR"
+_SOFTWARE_COMPOSITING_STATUS: Dict[str, str] = {
+    "DIRECT3D_9_LAYERS": "4|" + _VM_FAILURE,
+    "DIRECT3D_10_LAYERS": "4|" + _VM_FAILURE,
+    "DIRECT3D_10_1_LAYERS": "4|" + _VM_FAILURE,
+    "DIRECT3D_11_LAYERS": "4|" + _VM_FAILURE,
+    "GPU_PROCESS": "1",
+    "WEBRENDER": "4|" + _VM_FAILURE,
+    "WEBRENDER_COMPOSITOR": "4|" + _VM_FAILURE,
+    "WEBRENDER_SCISSORED_CACHE_CLEARS": "4|" + _VM_FAILURE,
+    "WEBRENDER_OPTIMIZED_SHADERS": "4|" + _VM_FAILURE,
+    "WEBRENDER_SHADER_CACHE": "4|" + _VM_FAILURE,
+    "WEBRENDER_PARTIAL_PRESENT": "4|" + _VM_FAILURE,
+    "WEBRENDER_DCOMP": "4|" + _VM_FAILURE,
+    "WEBRENDER_ANGLE_METAL": "1",
+    "D3D11_KEYED_MUTEX": "4|" + _VM_FAILURE,
+    "DX_INTEROP2": "4|" + _VM_FAILURE,
+    "CANVAS2D_ACCELERATION": "4|" + _VM_FAILURE,
+    "ACCELERATED_CANVAS2D": "4|" + _VM_FAILURE,
+}
+
+# Windows only: on Linux the compositor is already software (llvmpipe goes to software
+# WebRender through gfx.webrender.reject-software-driver, true on GTK), so no pref there.
+_WIN_SOFTWARE_COMPOSITING_PREFS: Dict[str, Any] = {
+    "gfx.webrender.software":       True,   # STEALTH-HOOK declared software compositing: owner's decision 2026-11-15, same on every machine
+    "gfx.webrender.software.d3d11": False,  # STEALTH-HOOK declared software compositing: owner's decision 2026-11-15, no D3D11 compositor, same on every machine
+}
+
+
+def _declare_software_compositing(table: str) -> str:
+    """The persona's feature table with ONLY the compositing features replaced by the
+    decision official Firefox 159 takes with no GPU. Order, names and every other entry
+    are the device's own."""
+    out = []
+    for entry in table.split(","):
+        name = entry.split("|", 1)[0]
+        out.append("%s|%s" % (name, _SOFTWARE_COMPOSITING_STATUS[name])
+                   if name in _SOFTWARE_COMPOSITING_STATUS else entry)
+    return ",".join(out)
+
+
 def _apply_gpu_persona(prefs: Dict[str, Any], profile: Profile):
     """The validated WebGL persona, and the reason it is applied on every host.
 
@@ -1223,7 +1268,10 @@ def _apply_gpu_persona(prefs: Dict[str, Any], profile: Profile):
                    or choose_gfx_device(persona, profile.seed))
         if not _device:
             raise ValueError("the persona %r has no real device to declare" % profile.gpu.renderer)
-        prefs["zoom.stealth.gfx.feature_status"] = _device["feature_status"]
+        prefs["zoom.stealth.gfx.feature_status"] = _declare_software_compositing(
+            _device["feature_status"])
+        if sys.platform == "win32":
+            prefs.update(_WIN_SOFTWARE_COMPOSITING_PREFS)
     else:
         # ⛔ This emitted empty renderer and vendor until 2026-11-01, which left
         # WebGL to the host and its blocklist. The engine refuses to start on an
@@ -1854,7 +1902,7 @@ def _apply_timezone(prefs: Dict[str, Any], timezone: Optional[str]) -> None:
     # not know to the MACHINE's zone, in silence (js/src/vm/DateTime.cpp,
     # DateTimeInfo::timeZone), and ICU's lookup is exact: "america/phoenix"
     # names no zone. An explicit zone reached this line unchecked until the
-    # firefox-50 pin (resolve_session_timezone returns it as given); one from
+    # firefox-50 pin (prepare_session_geo returns it as given); one from
     # the exit was already checked in _geo.ip_to_timezone. Same spelling test
     # here, the IANA database's own names, and the caller gets the right one.
     if zone not in _iana_zones():
@@ -1921,9 +1969,6 @@ def _apply_caller_overlay(prefs: Dict[str, Any],
     general.useragent.override means literally empty UA).
     """
     if extra_prefs:
-        for k in extra_prefs:
-            if k in USAGE_PING_PREFS:
-                raise ValueError("%s: %s" % (k, USAGE_PING_REFUSAL))
         for k, v in extra_prefs.items():
             if v is None:
                 prefs.pop(k, None)
@@ -2242,20 +2287,6 @@ def compose_session_prefs(
     # setdefault, so an explicit caller override still wins.
     prefs.setdefault("zoom.stealth.focus.ignore_os_deactivation",
                      IGNORE_OS_DEACTIVATION)
-
-    # The launch counter's address, declared here for every session. The engine
-    # fetches a five-byte release asset once at startup and the asset's download
-    # count is the number of launches; the address is a pref precisely so that
-    # moving the counter is a declaration in this file and not a rebuild (it
-    # died twice as a repository name compiled into every shipped binary). The
-    # asset lives on the engine's own repository: the thing that pings and the
-    # thing that is counted are the same release series. Engines older than
-    # firefox-21 do not read the pref and keep asking the address compiled into
-    # them. ASSIGNED, never `setdefault`: the counter is part of the package, a
-    # caller cannot move it (`_apply_caller_overlay` refuses the pref) and
-    # `invisible_firefox.usage_ping.enabled` is never written, so the engine's
-    # default (on) is the only state.
-    prefs["invisible_firefox.usage_ping.url"] = USAGE_PING_URL
 
     if humanize is not None:
         prefs.update(humanize_prefs(humanize))
